@@ -1,24 +1,7 @@
 """
-============================================================================
-互补特征融合集成方案 (Complementary Feature Fusion Ensemble)
-============================================================================
-
-核心思路：
-1. 专家 A：LightCRNN (时间序列专家) - 捕捉旋律时序特征，输出 160 维特征
-   - CNN 通道: [24, 48, 96, 192] (轻量化设计)
-   - RNN: 80 隐藏层 × 2方向 = 160 维
-   - 参数量: ~50w (极度轻量)
-   - 频率平均池化抗噪
-2. 专家 B：MobileNetV3-Small (空间纹理专家) - 捕捉声纹纹理特征，输出 576 维特征
-3. 融合策略：特征拼接 (736维) + 浅层 MLP 分类器
-
-优势：
-- 消除单模型的结构性盲区
-- 极低训练开销（冻结专家，只训练 ~10 万参数的分类头）
-- 快速训练，稳定的泛化性能
-
-作者：CBU5201 Mini Project
-============================================================================
+互补特征融合集成方案 - CBU5201 Mini Project
+- 专家 A: LightCRNN (160维) + 专家 B: MobileNetV3-Small (576维)
+- 融合: 特征拼接 (736维) + MLP 分类器
 """
 
 import numpy as np
@@ -32,6 +15,8 @@ from tqdm import tqdm
 import soundfile as sf
 import pyworld as pw
 from joblib import Parallel, delayed
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
@@ -50,133 +35,168 @@ import torchaudio
 import torchaudio.transforms as T
 
 
-# ==========================================
-# Device detection (GPU/CPU) - 打印仅一次，避免多进程/重复导入重复输出
+# Device detection
 def _detect_device_once():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    already_printed = os.environ.get("DEVICE_INFO_PRINTED") == "1"
-
-    if not already_printed:
-        if device == 'cuda':
-            print(f"✓ GPU detected: {torch.cuda.get_device_name(0)}")
-            print(f"✓ Using device: {device}")
-        else:
-            print(f"⚠ No GPU available, using device: {device}")
+    if os.environ.get("DEVICE_INFO_PRINTED") != "1":
+        gpu_info = f"GPU: {torch.cuda.get_device_name(0)}" if device == 'cuda' else "CPU only"
+        print(f"[Device] {gpu_info}")
         os.environ["DEVICE_INFO_PRINTED"] = "1"
-
     return device
-
 
 DEVICE = _detect_device_once()
 
 
-# ==========================================
-# the parameters
-# ==========================================
-DEFAULT_DATA_DIR = r"C:\Users\guson\Desktop\ml_project\Data\MLEndHW\MLEndHW_sample_800"
-PRETRAINED_WEIGHTS_DIR = r"C:\Users\guson\Desktop\ml_project\pretrained_weights"
-VALID_SONGS = ['TryEverything', 'RememberMe', 'NewYork', 'Friend',
-               'Necessities', 'Married', 'Happy', 'Feeling']
-SONG_TO_LABEL = {song: idx for idx, song in enumerate(VALID_SONGS)}
-LABEL_TO_SONG = {idx: song for idx, song in enumerate(VALID_SONGS)}
+# ==================== 配置系统 ====================
+
+@dataclass
+class DataConfig:
+    data_dir: str = r"C:\Users\guson\Desktop\ml_project\Data\MLEndHW\MLEndHW_sample_800"
+    pretrained_weights_dir: str = r"C:\Users\guson\Desktop\ml_project\pretrained_weights"
+    valid_songs: List[str] = field(default_factory=lambda: [
+        'TryEverything', 'RememberMe', 'NewYork', 'Friend',
+        'Necessities', 'Married', 'Happy', 'Feeling'
+    ])
+    train_ratio: float = 0.7
+    val_ratio: float = 0.15
+    test_ratio: float = 0.15
+    random_seed: int = 45
+    n_jobs: Optional[int] = None
+
+@dataclass
+class AudioConfig:
+    sample_rate: int = 22050
+    n_mels: int = 128
+    n_fft: int = 2048
+    hop_length: int = 512
+    duration_seconds: float = 12.0
+    max_length: int = 512
+
+@dataclass
+class ModelConfig:
+    crnn_rnn_hidden_size: int = 80
+    crnn_rnn_num_layers: int = 2
+    crnn_dropout_rate: float = 0.7
+    crnn_use_attention: bool = True
+    crnn_attention_hidden_size: int = 64
+    crnn_cnn_channels: List[int] = field(default_factory=lambda: [24, 48, 96, 192])
+    crnn_cnn_dropout: float = 0.1
+    mobilenet_pretrained: bool = True
+    mobilenet_feature_dim: int = 576
+    fusion_hidden_dim: int = 128
+    fusion_dropout_rate: float = 0.5
+    num_classes: int = 8
+    freeze_experts: bool = True
+
+@dataclass
+class TrainingConfig:
+    batch_size: int = 32
+    num_epochs_experts: int = 60
+    num_epochs_fusion: int = 15
+    learning_rate: float = 0.0005
+    weight_decay: float = 1e-4
+    scheduler_mode: str = 'max'
+    scheduler_factor: float = 0.5
+    scheduler_patience: int = 5
+    num_workers: int = 4
+    pin_memory: bool = True
+    early_stopping_patience: Optional[int] = None
+    save_best_only: bool = True
+    verbose: bool = True
+
+@dataclass
+class Config:
+    data: DataConfig = field(default_factory=DataConfig)
+    audio: AudioConfig = field(default_factory=AudioConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+
+    def __post_init__(self):
+        self.data.song_to_label = {song: idx for idx, song in enumerate(self.data.valid_songs)}
+        self.data.label_to_song = {idx: song for idx, song in enumerate(self.data.valid_songs)}
+
+    def print_config(self):
+        print(f"[Config] seed={self.data.random_seed}, batch={self.training.batch_size}, "
+              f"lr={self.training.learning_rate}, epochs={self.training.num_epochs_experts}/{self.training.num_epochs_fusion}")
 
 
-# ==========================================
-# 0. 预训练权重缓存管理
-# ==========================================
+# 创建全局配置实例
+CONFIG = Config()
+
+# 兼容性：保留原有的全局变量（避免破坏现有代码）
+RANDOM_SEED = CONFIG.data.random_seed
+DEFAULT_DATA_DIR = CONFIG.data.data_dir
+PRETRAINED_WEIGHTS_DIR = CONFIG.data.pretrained_weights_dir
+VALID_SONGS = CONFIG.data.valid_songs
+SONG_TO_LABEL = CONFIG.data.song_to_label
+LABEL_TO_SONG = CONFIG.data.label_to_song
+
+
+# 随机种子设置
+def set_random_seed(seed=None):
+    seed = seed or RANDOM_SEED
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if os.environ.get("SEED_INFO_PRINTED") != "1":
+        print(f"[Seed] {seed}")
+        os.environ["SEED_INFO_PRINTED"] = "1"
+    return seed
+
+set_random_seed(RANDOM_SEED)
+
+
+def log_section(title):
+    """打印分节日志"""
+    print(f"\n{'='*60}\n{title}\n{'='*60}")
+
 def get_or_download_pretrained_mobilenetv3():
-    """
-    获取或下载 MobileNetV3-Small 预训练权重
-
-    返回:
-        model: 加载了权重的 MobileNetV3-Small backbone
-        from_cache: 是否从缓存加载
-    """
+    """获取或下载 MobileNetV3-Small 预训练权重"""
     os.makedirs(PRETRAINED_WEIGHTS_DIR, exist_ok=True)
     cache_path = os.path.join(PRETRAINED_WEIGHTS_DIR, 'mobilenetv3_small_timm.pth')
 
     if os.path.exists(cache_path):
-        print(f"✓ 从本地缓存加载 MobileNetV3-Small 预训练权重: {cache_path}")
         try:
-            # 先创建一个不带预训练的模型结构
-            model = timm.create_model(
-                'mobilenetv3_small_100',
-                pretrained=False,
-                num_classes=0,
-                in_chans=1
-            )
-            # 加载缓存的权重（只加载 backbone 部分）
+            model = timm.create_model('mobilenetv3_small_100', pretrained=False, num_classes=0, in_chans=1)
             state_dict = torch.load(cache_path, map_location='cpu', weights_only=True)
             model.load_state_dict(state_dict, strict=False)
-            print(f"  ✓ 成功从缓存加载权重")
             return model, True
-        except Exception as e:
-            print(f"  ⚠ 缓存加载失败: {e}，将重新下载")
+        except Exception:
+            pass
 
-    # 从 Hugging Face 下载
-    print(f"从 Hugging Face 下载 MobileNetV3-Small 预训练权重...")
     try:
-        model = timm.create_model(
-            'mobilenetv3_small_100',
-            pretrained=True,
-            num_classes=0,
-            in_chans=1
-        )
-        # 保存权重到本地缓存
+        model = timm.create_model('mobilenetv3_small_100', pretrained=True, num_classes=0, in_chans=1)
         torch.save(model.state_dict(), cache_path)
-        print(f"✓ 预训练权重已下载并保存到: {cache_path}")
         return model, False
-    except Exception as e:
-        print(f"⚠ 预训练权重下载失败: {e}")
-        print(f"  将使用随机初始化的权重")
-        model = timm.create_model(
-            'mobilenetv3_small_100',
-            pretrained=False,
-            num_classes=0,
-            in_chans=1
-        )
+    except Exception:
+        model = timm.create_model('mobilenetv3_small_100', pretrained=False, num_classes=0, in_chans=1)
         return model, False
 
 
-# ==========================================
-# 1. Metadata Parsing
-# ==========================================
+# ==================== 数据处理 ====================
+
 def parse_filenames(files, return_mappings=False):
-    """
-    Parse file names and generate a DataFrame with metadata.
-    File name format: [Participant ID]_[Type]_[Interpretation]_[Song].wav
-    """
+    """解析文件名生成 DataFrame"""
     data = []
-
     for file_path in files:
         filename = os.path.basename(file_path)
-
         try:
             parts = filename.replace('.wav', '').split('_')
             if len(parts) >= 4:
-                participant_id = parts[0]
-                type_recording = parts[1]
-                interpretation = parts[2]
-                song_name = parts[3]
-
-                song_label = SONG_TO_LABEL.get(song_name, -1)
-
                 data.append({
-                    'file_id': filename,
-                    'file_path': file_path,
-                    'participant': participant_id,
-                    'type': type_recording,
-                    'interpretation': interpretation,
-                    'song': song_name,
-                    'label': song_label
+                    'file_id': filename, 'file_path': file_path,
+                    'participant': parts[0], 'type': parts[1],
+                    'interpretation': parts[2], 'song': parts[3],
+                    'label': SONG_TO_LABEL.get(parts[3], -1)
                 })
         except Exception as e:
             print(f"Error parsing {filename}: {e}")
 
     df = pd.DataFrame(data)
-    print(f"\nParsing completed: Successfully parsed {len(df)} files")
-
-    print("\nSong label mapping:")
+    print(f"Parsed {len(df)} files")
     for song, label in SONG_TO_LABEL.items():
         count = len(df[df['song'] == song]) if len(df) > 0 else 0
         print(f"  {label}: {song:20s} ({count} files)")
@@ -186,140 +206,68 @@ def parse_filenames(files, return_mappings=False):
     return df
 
 
-# ==========================================
-# 2. Audio Cleaning
-# ==========================================
-def remove_silence(audio, sr, top_db=30, frame_length=2048, hop_length=512, min_duration=0.1, verbose=False):
-    """
-    VAD: remove the silent fragments at the beginning and end of the audio.
-    """
-    original_duration = len(audio) / sr
+# ==================== 音频处理 ====================
 
+def remove_silence(audio, sr, top_db=30, frame_length=2048, hop_length=512, min_duration=0.1, verbose=False):
+    """VAD: 移除音频首尾静音"""
     audio_abs = np.abs(audio)
     num_frames = 1 + (len(audio_abs) - frame_length) // hop_length
-
-    energy = np.array([
-        np.sum(audio_abs[i * hop_length:i * hop_length + frame_length] ** 2)
-        for i in range(num_frames)
-    ])
-
-    energy = np.maximum(energy, 1e-10)
-    energy_db = 10 * np.log10(energy)
-    max_energy_db = np.max(energy_db)
-
-    threshold = max_energy_db - top_db
-
-    voiced_frames = energy_db > threshold
+    energy = np.array([np.sum(audio_abs[i * hop_length:i * hop_length + frame_length] ** 2) for i in range(num_frames)])
+    energy_db = 10 * np.log10(np.maximum(energy, 1e-10))
+    voiced_frames = energy_db > (np.max(energy_db) - top_db)
 
     if not np.any(voiced_frames):
-        if verbose:
-            print(f"    Warning: No voiced segments detected, keeping original audio")
         return audio
 
     first_voiced = np.argmax(voiced_frames)
     last_voiced = len(voiced_frames) - np.argmax(voiced_frames[::-1]) - 1
-
     start_sample = max(0, first_voiced * hop_length)
     end_sample = min(len(audio), (last_voiced + 1) * hop_length + frame_length)
 
-    trimmed_duration = (end_sample - start_sample) / sr
-    if trimmed_duration < min_duration:
-        if verbose:
-            print(f"    Warning: Trimmed duration {trimmed_duration:.2f}s is too short, keeping original audio")
+    if (end_sample - start_sample) / sr < min_duration:
         return audio
-
-    trimmed_audio = audio[start_sample:end_sample]
-
-    if verbose:
-        removed_start = start_sample / sr
-        removed_end = (len(audio) - end_sample) / sr
-        print(f"Original duration: {original_duration:.2f}s, "
-              f"Removed from start: {removed_start:.2f}s, "
-              f"Removed from end: {removed_end:.2f}s, "
-              f"Kept: {trimmed_duration:.2f}s")
-
-    return trimmed_audio
+    return audio[start_sample:end_sample]
 
 
 def preprocess_audio(audio, sr, remove_dc=True, normalize=True):
-    """
-    Audio preprocessing: remove the DC component and normalize the audio.
-    """
+    """音频预处理：去直流+归一化"""
     audio = audio.copy()
-
     if remove_dc:
         audio = audio - np.mean(audio)
-
     if normalize:
         max_val = np.max(np.abs(audio))
         if max_val > 0:
             audio = audio / max_val
-
     return audio
 
 
-# ==========================================
-# 3. 数据增强 (Data Augmentation with PyWorld)
-# ==========================================
-def pitch_shift_pyworld(audio, sr, n_steps):
-    """Pitch shift using PyWorld"""
+# ==================== 数据增强 ====================
+def _pyworld_analysis(audio, sr, frame_period=5.0):
+    """PyWorld 分析 (提取 F0, SP, AP)"""
     audio = np.asarray(audio, dtype=np.float64)
+    f0, t = pw.dio(audio, sr, frame_period=frame_period)
+    f0 = pw.stonemask(audio, f0, t, sr)
+    sp = pw.cheaptrick(audio, f0, t, sr)
+    ap = pw.d4c(audio, f0, t, sr)
+    return f0, sp, ap, frame_period
 
-    frame_period = 5.0
-    f0, timeaxis = pw.dio(audio, sr, frame_period=frame_period)
-    f0 = pw.stonemask(audio, f0, timeaxis, sr)
-    sp = pw.cheaptrick(audio, f0, timeaxis, sr)
-    ap = pw.d4c(audio, f0, timeaxis, sr)
-
-    shift_ratio = 2 ** (n_steps / 12.0)
-    f0_shifted = f0 * shift_ratio
-
-    augmented_audio = pw.synthesize(f0_shifted, sp, ap, sr, frame_period)
-
-    return augmented_audio
-
+def pitch_shift_pyworld(audio, sr, n_steps):
+    f0, sp, ap, fp = _pyworld_analysis(audio, sr)
+    f0_shifted = f0 * (2 ** (n_steps / 12.0))
+    return pw.synthesize(f0_shifted, sp, ap, sr, fp)
 
 def time_stretch_pyworld(audio, sr, speed_ratio):
-    """Time stretching using PyWorld"""
-    audio = np.asarray(audio, dtype=np.float64)
-
-    frame_period = 5.0
-    f0, timeaxis = pw.dio(audio, sr, frame_period=frame_period)
-    f0 = pw.stonemask(audio, f0, timeaxis, sr)
-    sp = pw.cheaptrick(audio, f0, timeaxis, sr)
-    ap = pw.d4c(audio, f0, timeaxis, sr)
-
-    original_frames = len(f0)
-    new_frames = int(original_frames / speed_ratio)
-
-    if new_frames < 2:
-        new_frames = 2
-
-    original_indices = np.arange(original_frames)
-    new_indices = np.linspace(0, original_frames - 1, new_frames)
-
-    f0_stretched = np.interp(new_indices, original_indices, f0)
-
-    sp_stretched = np.zeros((new_frames, sp.shape[1]))
-    for i in range(sp.shape[1]):
-        sp_stretched[:, i] = np.interp(new_indices, original_indices, sp[:, i])
-
-    ap_stretched = np.zeros((new_frames, ap.shape[1]))
-    for i in range(ap.shape[1]):
-        ap_stretched[:, i] = np.interp(new_indices, original_indices, ap[:, i])
-
-    augmented_audio = pw.synthesize(f0_stretched, sp_stretched, ap_stretched, sr, frame_period)
-
-    return augmented_audio
-
+    f0, sp, ap, fp = _pyworld_analysis(audio, sr)
+    n_frames = max(2, int(len(f0) / speed_ratio))
+    idx_old, idx_new = np.arange(len(f0)), np.linspace(0, len(f0) - 1, n_frames)
+    f0_s = np.interp(idx_new, idx_old, f0)
+    sp_s = np.array([np.interp(idx_new, idx_old, sp[:, i]) for i in range(sp.shape[1])]).T
+    ap_s = np.array([np.interp(idx_new, idx_old, ap[:, i]) for i in range(ap.shape[1])]).T
+    return pw.synthesize(f0_s, sp_s, ap_s, sr, fp)
 
 def add_gaussian_noise(audio, noise_level=0.005):
-    """Add Gaussian noise to the audio signal"""
-    signal_std = np.std(audio)
-    noise = np.random.normal(0, signal_std * noise_level, len(audio))
-    augmented_audio = audio + noise
-    augmented_audio = np.clip(augmented_audio, -1.0, 1.0)
-    return augmented_audio
+    noise = np.random.normal(0, np.std(audio) * noise_level, len(audio))
+    return np.clip(audio + noise, -1.0, 1.0)
 
 
 def augment_single_audio(audio, sr, augmentation_type, param):
@@ -385,7 +333,7 @@ def _augment_worker(row_dict, strategies, output_dir, verbose=False):
 def augment_dataset(df, output_dir, target_total=4000, verbose=True, n_jobs=1, skip_existing=True):
     """Batch data augmentation: expand the original dataset to the target number"""
     print("\n" + "="*60)
-    print("开始数据增强 (Data Augmentation)")
+    print("Starting Data Augmentation")
     print("="*60)
 
     os.makedirs(output_dir, exist_ok=True)
@@ -393,7 +341,7 @@ def augment_dataset(df, output_dir, target_total=4000, verbose=True, n_jobs=1, s
     if skip_existing:
         existing_aug_files = glob.glob(os.path.join(output_dir, '*_aug_*.wav'))
         if len(existing_aug_files) > 0:
-            print(f"\n✓ 检测到已有 {len(existing_aug_files)} 个增强音频文件")
+            print(f"\n✓ Found {len(existing_aug_files)} existing augmented audio files")
 
             augmented_data = []
 
@@ -440,29 +388,29 @@ def augment_dataset(df, output_dir, target_total=4000, verbose=True, n_jobs=1, s
             current_total = len(augmented_df)
 
             if current_total >= target_total:
-                print(f"已有样本数 ({current_total}) >= 目标数 ({target_total})，跳过生成")
+                print(f"Current samples ({current_total}) >= target ({target_total}), skipping generation")
                 return augmented_df
             else:
-                print(f"已有样本数 {current_total} < 目标 {target_total}，将补充 {target_total - current_total} 个")
+                print(f"Current samples {current_total} < target {target_total}, will generate {target_total - current_total} more")
         else:
-            print("未检测到已有增强文件，将全新生成")
+            print("No existing augmented files detected, will generate from scratch")
     else:
-        print("skip_existing=False，将重新生成所有增强文件")
+        print("skip_existing=False, will regenerate all augmented files")
 
     original_count = len(df)
     augmentations_needed = target_total - original_count
 
-    print(f"原始样本数: {original_count}")
-    print(f"目标总数: {target_total}")
-    print(f"需要生成增强样本: {augmentations_needed}")
+    print(f"Original samples: {original_count}")
+    print(f"Target total: {target_total}")
+    print(f"Augmentations needed: {augmentations_needed}")
 
     if augmentations_needed <= 0:
-        print("样本数已满足目标，无需增强")
+        print("Sample count already meets target, no augmentation needed")
         return df
 
     augmentations_per_sample = int(np.ceil(augmentations_needed / original_count))
 
-    print(f"每个原始样本生成 {augmentations_per_sample} 个增强版本")
+    print(f"Generating {augmentations_per_sample} augmented versions per original sample")
 
     augmentation_strategies = [
         # 两个 0.5 音高偏移（±0.5 半音）
@@ -475,7 +423,7 @@ def augment_dataset(df, output_dir, target_total=4000, verbose=True, n_jobs=1, s
     ]
 
     if augmentations_per_sample > len(augmentation_strategies) and verbose:
-        print(f"提示: 需要 {augmentations_per_sample} 种增强，已循环使用 {len(augmentation_strategies)} 种策略")
+        print(f"Note: Need {augmentations_per_sample} augmentations, will cycle through {len(augmentation_strategies)} strategies")
 
     augmented_data = []
 
@@ -491,7 +439,7 @@ def augment_dataset(df, output_dir, target_total=4000, verbose=True, n_jobs=1, s
             'augmentation': 'original'
         })
 
-    print("\n开始生成增强样本...")
+    print("\nStarting to generate augmented samples...")
 
     tasks = []
     remaining = augmentations_needed
@@ -505,13 +453,13 @@ def augment_dataset(df, output_dir, target_total=4000, verbose=True, n_jobs=1, s
 
     if n_jobs == 1:
         results_lists = []
-        for row_dict, strategies in tqdm(tasks, desc="增强进度"):
+        for row_dict, strategies in tqdm(tasks, desc="Augmentation progress"):
             results_lists.append(_augment_worker(row_dict, strategies, output_dir, verbose=verbose))
     else:
-        print(f"使用并行计算: n_jobs={n_jobs}")
+        print(f"Using parallel computation: n_jobs={n_jobs}")
         results_lists = Parallel(n_jobs=n_jobs, backend="loky")(
             delayed(_augment_worker)(row_dict, strategies, output_dir, verbose=False)
-            for row_dict, strategies in tqdm(tasks, desc="调度任务")
+            for row_dict, strategies in tqdm(tasks, desc="Scheduling tasks")
         )
 
     for res in results_lists:
@@ -522,16 +470,17 @@ def augment_dataset(df, output_dir, target_total=4000, verbose=True, n_jobs=1, s
     augmented_df = pd.DataFrame(augmented_data)
 
     print("\n" + "="*60)
-    print(f"数据增强完成: 原始 {original_count} -> 生成 {generated_count}, 总计 {len(augmented_df)}")
-    print(f"输出目录: {output_dir}")
+    print(f"Data augmentation completed: Original {original_count} -> Generated {generated_count}, Total {len(augmented_df)}")
+    print(f"Output directory: {output_dir}")
 
     if verbose:
-        print("\n增强类型分布:")
+        print("\nAugmentation type distribution:")
         aug_counts = augmented_df['augmentation'].value_counts()
         for aug_type, count in aug_counts.items():
-            print(f"  {aug_type}: {count} 个样本")
+            print(f"  {aug_type}: {count} samples")
 
     return augmented_df
+
 
 
 # ==========================================
@@ -611,57 +560,41 @@ def extract_mel_spectrogram_torchaudio(file_path, target_frames=128, target_freq
             print(f"Error extracting Mel spectrogram from {file_path}: {e}")
         return None
 
-# extract the f0 contour from the audio
 def extract_f0_contour_pyworld(file_path, target_frames=32, verbose=False):
+    """提取 F0 轮廓"""
     try:
         audio, sr = sf.read(file_path)
         if len(audio.shape) > 1:
             audio = np.mean(audio, axis=1)
         audio = np.asarray(audio, dtype=np.float64)
 
-        # VAD: remove the silence at the beginning and end of the audio
+        # VAD
         energy = audio ** 2
-        threshold = energy.max() * 0.01
-        voiced = energy > threshold
+        voiced = energy > (energy.max() * 0.01)
         if np.any(voiced):
             idx = np.where(voiced)[0]
             audio = audio[idx[0]:idx[-1] + 1]
         if len(audio) < sr * 0.1:
-            if verbose:
-                print(f"  警告: {file_path} 音频太短 (F0)")
             return None
 
-        # extract the f0 contour
         _f0, t = pw.dio(audio, sr)
         f0 = pw.stonemask(audio, _f0, t, sr)
-
-        # only keep the voiced frames, filter out the silence
         valid = f0 > 1e-6
         if not np.any(valid):
-            if verbose:
-                print(f"  警告: {file_path} F0 全零/无效")
             return None
 
-        # log2 normalization: log2(f0 / 100)
         log_f0 = np.log2(np.maximum(f0, 1e-6) / 100.0)
-
-        # interpolate to the target length target_frames
-        orig_idx = np.linspace(0, 1, len(log_f0))
-        target_idx = np.linspace(0, 1, target_frames)
+        orig_idx, target_idx = np.linspace(0, 1, len(log_f0)), np.linspace(0, 1, target_frames)
         log_f0_interp = np.interp(target_idx, orig_idx[valid], log_f0[valid])
-
-        # simple standardization to zero mean/unit variance, improve stability
         log_f0_interp = (log_f0_interp - log_f0_interp.mean()) / (log_f0_interp.std() + 1e-6)
-
         return log_f0_interp.astype(np.float32)
-    except Exception as e:
-        if verbose:
-            print(f"Error extracting F0 from {file_path}: {e}")
+    except Exception:
         return None
 
 
-# split the dataset by the participants, train: 70%, val: 15%, test: 15%
-def split_by_participant(df, train_ratio=0.7, val_ratio=0.15, seed=44):
+def split_by_participant(df, train_ratio=0.7, val_ratio=0.15, seed=None):
+    """按参与者划分数据集 (LOGO)"""
+    seed = seed or RANDOM_SEED
     participants = np.array(sorted(df['participant'].unique()))
     rng = np.random.default_rng(seed)
     rng.shuffle(participants)
@@ -669,31 +602,25 @@ def split_by_participant(df, train_ratio=0.7, val_ratio=0.15, seed=44):
     n_total = len(participants)
     n_train = max(1, int(round(n_total * train_ratio)))
     n_val = max(1, int(round(n_total * val_ratio)))
-
     if n_train + n_val >= n_total:
-        n_train = max(1, n_total - 2)
-        n_val = 1
+        n_train, n_val = max(1, n_total - 2), 1
 
-    # split the participants into train, val, test
-    train_participants = participants[:n_train]
-    val_participants = participants[n_train:n_train + n_val]
-    test_participants = participants[n_train + n_val:]
+    train_p = participants[:n_train]
+    val_p = participants[n_train:n_train + n_val]
+    test_p = participants[n_train + n_val:]
+    if len(test_p) == 0:
+        test_p, val_p = val_p[-1:], val_p[:-1]
 
-    if len(test_participants) == 0:
-        test_participants = val_participants[-1:]
-        val_participants = val_participants[:-1]
-
-    # get the index of the participants
     def idx_for(parts):
         return np.where(df['participant'].isin(parts).values)[0]
 
     return {
-        'train': idx_for(train_participants),
-        'val': idx_for(val_participants),
-        'test': idx_for(test_participants),
-        'train_parts': train_participants,
-        'val_parts': val_participants,
-        'test_parts': test_participants,
+        'train': idx_for(train_p),
+        'val': idx_for(val_p),
+        'test': idx_for(test_p),
+        'train_parts': train_p,
+        'val_parts': val_p,
+        'test_parts': test_p,
     }
 
 
@@ -1131,6 +1058,8 @@ class AudioMobileNetV3(nn.Module):
         return self.head(features)
 
 
+
+
 # ==========================================
 # 8. 频谱图批量提取
 # ==========================================
@@ -1326,11 +1255,11 @@ def extract_dual_spectrograms_from_dataframe(df, save_path=None, mel_target_fram
 def clear_cache(device=None, verbose=False):
     """
     Clear Python GC and CUDA cache.
-    Prints a message only once by default to avoid log spam during training loops.
+    默认静默；仅在 verbose=True 时打印（且只打印一次），避免训练循环污染输出。
 
     Args:
         device: Target device, uses global DEVICE if None
-        verbose: Compatibility parameter, no longer used
+        verbose: 是否打印一次性提示
     """
     import gc
     gc.collect()
@@ -1345,9 +1274,9 @@ def clear_cache(device=None, verbose=False):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    # Print message only on first call to avoid repeated output
-    if os.environ.get("CACHE_CLEAR_INFO_PRINTED") != "1":
-        print("ℹ Memory cleanup executed (GC + CUDA cache)")
+    # 仅在 verbose=True 时提示，且只提示一次
+    if verbose and os.environ.get("CACHE_CLEAR_INFO_PRINTED") != "1":
+        print("[Cache] cleared (GC + CUDA cache)")
         os.environ["CACHE_CLEAR_INFO_PRINTED"] = "1"
 
 
@@ -1394,9 +1323,14 @@ def train_model(model, train_loader, val_loader, num_epochs=50, learning_rate=0.
 
     weight_tensor = class_weights.to(device) if class_weights is not None else None
     criterion = nn.CrossEntropyLoss(weight=weight_tensor)
-    optimizer = optim.Adam(params_to_optimize, lr=learning_rate, weight_decay=1e-4)
+    optimizer = optim.Adam(params_to_optimize, lr=learning_rate, weight_decay=CONFIG.training.weight_decay)
     scaler = torch.amp.GradScaler('cuda', enabled=(device == 'cuda'))
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode=CONFIG.training.scheduler_mode,
+        factor=CONFIG.training.scheduler_factor,
+        patience=CONFIG.training.scheduler_patience
+    )
 
     history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
     best_val_acc = 0.0
@@ -1595,15 +1529,16 @@ def plot_training_history(history, save_path='training_history.png'):
 # ==========================================
 # 11. 主流程：互补特征融合集成
 # ==========================================
-def run_feature_fusion_ensemble_pipeline(data_dir=None, augment=True,
-                                          batch_size=32, num_epochs_experts=50, num_epochs_fusion=15,
-                                          learning_rate=0.0005, n_jobs=None, force_regenerate=False,
+def run_feature_fusion_ensemble_pipeline(config: Config = None,
+                                          data_dir=None, augment=True,
+                                          batch_size=None, num_epochs_experts=None, num_epochs_fusion=None,
+                                          learning_rate=None, n_jobs=None, force_regenerate=False,
                                           skip_expert_training=False,
                                           crnn_model_path='crnn_model_mel_torchaudio.pth',
                                           mobilenet_model_path='mobilenetv3_model_mel_torchaudio.pth',
-                                          dropout_rate_fusion=0.5,
-                                          dropout_rate_expert=0.7,
-                                          use_attention=True,
+                                          dropout_rate_fusion=None,
+                                          dropout_rate_expert=None,
+                                          use_attention=None,
                                           use_f0=False):
     """
     互补特征融合集成完整流程
@@ -1611,444 +1546,164 @@ def run_feature_fusion_ensemble_pipeline(data_dir=None, augment=True,
     新策略：先划分数据集，只对训练集进行增强到 5 倍，验证/测试集保持原始
 
     参数:
-        data_dir: 数据目录
+        config: Config 对象（推荐使用，可以统一管理所有参数）
+        data_dir: 数据目录（如果为 None，从 config 或全局配置获取）
         augment: 是否使用数据增强（仅对训练集，自动增强到 5 倍）
-        batch_size: 批次大小
-        num_epochs_experts: 专家模型训练轮数
-        num_epochs_fusion: 融合分类器训练轮数
-        learning_rate: 学习率
-        n_jobs: 并行进程数
+        batch_size: 批次大小（如果为 None，从 config 获取）
+        num_epochs_experts: 专家模型训练轮数（如果为 None，从 config 获取）
+        num_epochs_fusion: 融合分类器训练轮数（如果为 None，从 config 获取）
+        learning_rate: 学习率（如果为 None，从 config 获取）
+        n_jobs: 并行进程数（如果为 None，从 config 获取）
         force_regenerate: 是否强制重新生成频谱图
         skip_expert_training: 是否跳过专家训练（使用预训练权重）
         crnn_model_path: CRNN 模型权重路径
         mobilenet_model_path: MobileNetV3-Small 模型权重路径
-        dropout_rate_fusion: 融合分类器的 dropout 率（默认 0.5）
-        dropout_rate_expert: 专家模型的 dropout 率（默认 0.7）
-        use_attention: 是否使用注意力机制
+        dropout_rate_fusion: 融合分类器的 dropout 率（如果为 None，从 config 获取）
+        dropout_rate_expert: 专家模型的 dropout 率（如果为 None，从 config 获取）
+        use_attention: 是否使用注意力机制（如果为 None，从 config 获取）
         use_f0: 是否使用 F0 特征
     """
-    print("\n" + "="*80)
-    print("互补特征融合集成方案 (Complementary Feature Fusion Ensemble)")
-    print("="*80)
-    print("\n架构说明:")
-    print("  - 专家 A: LightCRNN (时间序列专家) -> 160 维特征")
-    print("    * CNN: [24→48→96→192], RNN: 80×2=160")
-    print("    * 参数量: ~50w (极度轻量)")
-    print("  - 专家 B: MobileNetV3-Small (空间纹理专家) -> 576 维特征")
-    print("  - 融合: 特征拼接 (736 维) + 浅层 MLP 分类器 (~10 万参数)")
-    print("\n数据策略:")
-    print("  - 先按参与者划分训练/验证/测试集（70%/15%/15%）")
-    print("  - 只增强训练集到 5 倍（每个样本 +4 个增强版本）")
-    print("    * pitch shift ±0.5, time stretch 1.1, noise 0.005")
-    print("  - 验证集和测试集保持原始数据，确保评估公平性")
-    print("="*80)
+    # 参数处理
+    config = config or CONFIG
+    data_dir = data_dir or config.data.data_dir
+    batch_size = batch_size or config.training.batch_size
+    num_epochs_experts = num_epochs_experts or config.training.num_epochs_experts
+    num_epochs_fusion = num_epochs_fusion or config.training.num_epochs_fusion
+    learning_rate = learning_rate or config.training.learning_rate
+    n_jobs = n_jobs or config.data.n_jobs or max(1, os.cpu_count() or 1)
+    dropout_rate_fusion = dropout_rate_fusion or config.model.fusion_dropout_rate
+    dropout_rate_expert = dropout_rate_expert or config.model.crnn_dropout_rate
+    use_attention = use_attention if use_attention is not None else config.model.crnn_use_attention
+
+    log_section("Feature Fusion Ensemble Pipeline")
+    config.print_config()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    clear_cache(device=device, verbose=False)  # 静默清理，避免重复打印
+    clear_cache(device=device, verbose=False)
 
-    if data_dir is None:
-        data_dir = DEFAULT_DATA_DIR
-
-    if n_jobs is None:
-        n_jobs = max(1, os.cpu_count() or 1)
-
-    # ==========================================
-    # 步骤 1: 加载原始数据并划分
-    # ==========================================
-    print("\n" + "="*60)
-    print("步骤 1: 加载原始数据")
-    print("="*60)
-
-    # 加载原始数据
-    sample_path = os.path.join(data_dir, '**/*.wav')
-    files = glob.glob(sample_path, recursive=True)
-    print(f"找到 {len(files)} 个原始音频文件")
-
+    # Step 1: 加载数据
+    log_section("Step 1: Load Data")
+    files = glob.glob(os.path.join(data_dir, '**/*.wav'), recursive=True)
     df_original = parse_filenames(files)
-    print(f"原始样本数: {len(df_original)}")
 
-    # ==========================================
-    # 步骤 2: 按参与者划分数据集（在增强之前）
-    # ==========================================
-    print("\n" + "="*60)
-    print("步骤 2: 按参与者划分数据集 (LOGO 原则)")
-    print("="*60)
+    # Step 2: 划分数据集
+    log_section("Step 2: Split by Participant")
+    splits = split_by_participant(df_original, train_ratio=0.7, val_ratio=0.15, seed=RANDOM_SEED)
+    df_train_original = df_original.iloc[splits['train']].reset_index(drop=True)
+    df_val_original = df_original.iloc[splits['val']].reset_index(drop=True)
+    df_test_original = df_original.iloc[splits['test']].reset_index(drop=True)
+    print(f"Train: {len(df_train_original)}, Val: {len(df_val_original)}, Test: {len(df_test_original)}")
 
-    splits = split_by_participant(df_original, train_ratio=0.7, val_ratio=0.15, seed=42)
-
-    train_idx = splits['train']
-    val_idx = splits['val']
-    test_idx = splits['test']
-
-    df_train_original = df_original.iloc[train_idx].reset_index(drop=True)
-    df_val_original = df_original.iloc[val_idx].reset_index(drop=True)
-    df_test_original = df_original.iloc[test_idx].reset_index(drop=True)
-
-    print(f"Train: {len(df_train_original)} 样本, {len(splits['train_parts'])} 个参与者")
-    print(f"Val:   {len(df_val_original)} 样本, {len(splits['val_parts'])} 个参与者")
-    print(f"Test:  {len(df_test_original)} 样本, {len(splits['test_parts'])} 个参与者")
-
-    # ==========================================
-    # 步骤 3: 只增强训练集（增强到原始训练集的 5 倍）
-    # ==========================================
-    print("\n" + "="*60)
-    print("步骤 3: 数据增强（仅训练集）")
-    print("="*60)
-
+    # Step 3: 数据增强
+    log_section("Step 3: Data Augmentation")
     if augment:
         augmented_output_dir = r"C:\Users\guson\Desktop\ml_project\Data\augmented"
-        # 自动计算：增强到训练集的 5 倍
         train_target_total = len(df_train_original) * 5
-        print(f"增强策略: 训练集 × 5")
-        print(f"原始训练集: {len(df_train_original)} 样本")
-        print(f"目标总数: {train_target_total} 样本")
-
-        df_train_augmented = augment_dataset(
-            df=df_train_original,
-            output_dir=augmented_output_dir,
-            target_total=train_target_total,
-            verbose=False,
-            n_jobs=n_jobs
-        )
-        print(f"✓ 训练集增强完成: {len(df_train_original)} -> {len(df_train_augmented)} 样本 (扩增 {len(df_train_augmented) / len(df_train_original):.1f}x)")
+        df_train_augmented = augment_dataset(df=df_train_original, output_dir=augmented_output_dir,
+                                             target_total=train_target_total, verbose=False, n_jobs=n_jobs)
+        print(f"Train augmented: {len(df_train_original)} -> {len(df_train_augmented)} ({len(df_train_augmented) / len(df_train_original):.1f}x)")
     else:
         df_train_augmented = df_train_original
-        print("未启用数据增强")
 
-    # ==========================================
-    # 步骤 4: 分别提取训练/验证/测试集特征
-    # ==========================================
-    print("\n" + "="*60)
-    print("步骤 4: 提取特征（训练/验证/测试分开）")
-    print("="*60)
+    # Step 4: 提取特征
+    log_section("Step 4: Feature Extraction")
+    print("[1/3] Train features...")
+    def _extract_features(df, name):
+        print(f"[{name}]...")
+        if use_f0:
+            specs, f0s, labels, _ = extract_dual_spectrograms_from_dataframe(
+                df=df, save_path=None, mel_target_frames=512, mel_target_freq_bins=128,
+                f0_target_frames=32, verbose=False, n_jobs=n_jobs)
+        else:
+            specs, labels, _ = extract_spectrograms_from_dataframe(
+                df=df, save_path=None, target_frames=512, target_freq_bins=128, verbose=False, n_jobs=n_jobs)
+            f0s = None
+        return specs, f0s, labels
 
-    # 4.1 提取训练集特征（增强后）
-    print("\n[1/3] 提取训练集特征...")
-    if use_f0:
-        train_spectrograms, train_f0_contours, train_labels, _ = extract_dual_spectrograms_from_dataframe(
-            df=df_train_augmented,
-            save_path=None,
-            mel_target_frames=512,
-            mel_target_freq_bins=128,
-            f0_target_frames=32,
-            verbose=False,
-            n_jobs=n_jobs
-        )
-    else:
-        train_spectrograms, train_labels, _ = extract_spectrograms_from_dataframe(
-            df=df_train_augmented,
-            save_path=None,
-            target_frames=512,
-            target_freq_bins=128,
-            verbose=False,
-            n_jobs=n_jobs
-        )
-        train_f0_contours = None
+    train_spectrograms, train_f0_contours, train_labels = _extract_features(df_train_augmented, "Train")
+    print("[2/3] Val features...")
+    val_spectrograms, val_f0_contours, val_labels = _extract_features(df_val_original, "Val")
+    print("[3/3] Test features...")
+    test_spectrograms, test_f0_contours, test_labels = _extract_features(df_test_original, "Test")
 
-    if train_spectrograms is None or (use_f0 and train_f0_contours is None):
-        print("错误: 训练集特征提取失败")
+    if train_spectrograms is None or val_spectrograms is None or test_spectrograms is None:
+        print("Error: Feature extraction failed")
         return
+    print(f"Features: Train={train_spectrograms.shape}, Val={val_spectrograms.shape}, Test={test_spectrograms.shape}")
 
-    # 4.2 提取验证集特征（原始）
-    print("\n[2/3] 提取验证集特征（原始，无增强）...")
-    if use_f0:
-        val_spectrograms, val_f0_contours, val_labels, _ = extract_dual_spectrograms_from_dataframe(
-            df=df_val_original,
-            save_path=None,
-            mel_target_frames=512,
-            mel_target_freq_bins=128,
-            f0_target_frames=32,
-            verbose=False,
-            n_jobs=n_jobs
-        )
-    else:
-        val_spectrograms, val_labels, _ = extract_spectrograms_from_dataframe(
-            df=df_val_original,
-            save_path=None,
-            target_frames=512,
-            target_freq_bins=128,
-            verbose=False,
-            n_jobs=n_jobs
-        )
-        val_f0_contours = None
+    # Step 5: DataLoader
+    log_section("Step 5: Create DataLoader")
+    train_dataset = UnifiedAudioDataset(train_spectrograms, train_labels, f0_contours=train_f0_contours,
+                                        apply_spec_augment=True, freq_mask_param=15, time_mask_param=35)
+    val_dataset = UnifiedAudioDataset(val_spectrograms, val_labels, f0_contours=val_f0_contours, apply_spec_augment=False)
+    test_dataset = UnifiedAudioDataset(test_spectrograms, test_labels, f0_contours=test_f0_contours, apply_spec_augment=False)
 
-    if val_spectrograms is None or (use_f0 and val_f0_contours is None):
-        print("错误: 验证集特征提取失败")
-        return
-
-    # 4.3 提取测试集特征（原始）
-    print("\n[3/3] 提取测试集特征（原始，无增强）...")
-    if use_f0:
-        test_spectrograms, test_f0_contours, test_labels, _ = extract_dual_spectrograms_from_dataframe(
-            df=df_test_original,
-            save_path=None,
-            mel_target_frames=512,
-            mel_target_freq_bins=128,
-            f0_target_frames=32,
-            verbose=False,
-            n_jobs=n_jobs
-        )
-    else:
-        test_spectrograms, test_labels, _ = extract_spectrograms_from_dataframe(
-            df=df_test_original,
-            save_path=None,
-            target_frames=512,
-            target_freq_bins=128,
-            verbose=False,
-            n_jobs=n_jobs
-        )
-        test_f0_contours = None
-
-    if test_spectrograms is None or (use_f0 and test_f0_contours is None):
-        print("错误: 测试集特征提取失败")
-        return
-
-    print("\n✓ 所有特征提取完成")
-    print(f"  训练集: {train_spectrograms.shape}")
-    print(f"  验证集: {val_spectrograms.shape}")
-    print(f"  测试集: {test_spectrograms.shape}")
-
-    # ==========================================
-    # 步骤 5: 创建 DataLoader
-    # ==========================================
-    print("\n" + "="*60)
-    print("步骤 5: 创建 DataLoader")
-    print("="*60)
-
-    # 创建训练集 DataLoader（使用 SpecAugment）
-    train_dataset = UnifiedAudioDataset(
-        train_spectrograms,
-        train_labels,
-        f0_contours=train_f0_contours,
-        apply_spec_augment=True,
-        freq_mask_param=15,
-        time_mask_param=35
-    )
-
-    # 创建验证集 DataLoader（不使用 SpecAugment）
-    val_dataset = UnifiedAudioDataset(
-        val_spectrograms,
-        val_labels,
-        f0_contours=val_f0_contours,
-        apply_spec_augment=False
-    )
-
-    # 创建测试集 DataLoader（不使用 SpecAugment）
-    test_dataset = UnifiedAudioDataset(
-        test_spectrograms,
-        test_labels,
-        f0_contours=test_f0_contours,
-        apply_spec_augment=False
-    )
-
-    loader_workers = 4
-    pin_memory = True if torch.cuda.is_available() else False
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                            num_workers=loader_workers, pin_memory=pin_memory)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                          num_workers=loader_workers, pin_memory=pin_memory)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
-                           num_workers=loader_workers, pin_memory=pin_memory)
-
-    print(f"✓ DataLoader 创建完成")
-    print(f"  训练集: {len(train_dataset)} 样本")
-    print(f"  验证集: {len(val_dataset)} 样本")
-    print(f"  测试集: {len(test_dataset)} 样本")
+    loader_kwargs = dict(batch_size=batch_size, num_workers=config.training.num_workers,
+                        pin_memory=config.training.pin_memory if torch.cuda.is_available() else False)
+    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
+    print(f"DataLoader: Train={len(train_dataset)}, Val={len(val_dataset)}, Test={len(test_dataset)}")
 
     num_classes = len(np.unique(train_labels))
-
-    # 类别权重：按用户要求全部设为 1（等权）
     class_weights = None
-    print("\n类别权重: 全部设为 1（无权重）")
 
-    # ==========================================
-    # 步骤 6: 训练专家模型 (可选跳过)
-    # ==========================================
+    # Step 6: 训练专家模型
+    early_stop = config.training.early_stopping_patience or 10
     if not skip_expert_training:
-        print("\n" + "="*60)
-        print("步骤 3: 训练专家模型")
-        print("="*60)
+        log_section("Step 6: Train Expert Models")
 
-        # 3.1 训练 MobileNetV3-Small 专家
-        print("\n--- 训练专家 B: MobileNetV3-Small (空间纹理专家) ---")
-        mobilenet_model = AudioMobileNetV3(
-            num_classes=num_classes,
-            pretrained=True
-        )
-
+        # MobileNetV3
+        mobilenet_model = AudioMobileNetV3(num_classes=num_classes, pretrained=config.model.mobilenet_pretrained)
         mobilenet_model, mobilenet_history = train_model(
-            model=mobilenet_model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            num_epochs=num_epochs_experts,
-            learning_rate=learning_rate,
-            device=device,
-            early_stopping_patience=10,
-            model_name='MobileNetV3-Small Expert',
-            class_weights=class_weights
-        )
+            mobilenet_model, train_loader, val_loader, num_epochs_experts, learning_rate,
+            device, early_stop, 'MobileNetV3', class_weights)
+        torch.save({'model_state_dict': mobilenet_model.state_dict(), 'num_classes': num_classes}, mobilenet_model_path)
+        mobilenet_test_acc, _, _ = evaluate_model(mobilenet_model, test_loader, LABEL_TO_SONG, device)
 
-        # 保存 MobileNetV3 模型
-        torch.save({
-            'model_state_dict': mobilenet_model.state_dict(),
-            'num_classes': num_classes,
-            'history': mobilenet_history
-        }, mobilenet_model_path)
-        print(f"✓ MobileNetV3-Small 模型已保存到: {mobilenet_model_path}")
-
-        # 评估 MobileNetV3
-        print("\n--- MobileNetV3-Small 专家测试评估 ---")
-        mobilenet_test_acc, _, _ = evaluate_model(mobilenet_model, test_loader, LABEL_TO_SONG, device=device)
-
-        # 3.2 训练 CRNN 专家 (LightCRNN)
-        print("\n--- 训练专家 A: CRNN (时间序列专家) - LightCRNN 架构 (~50w参数) ---")
+        # CRNN
         crnn_model = CRNNClassifier(
-            num_classes=num_classes,
-            input_height=128,
-            input_width=512,
-            rnn_hidden_size=80,  # LightCRNN: 80 -> 160维输出
-            rnn_num_layers=2,
-            dropout_rate=dropout_rate_expert,
-            use_attention=use_attention,
-            attention_hidden_size=64  # 对应调整
-        )
-
+            num_classes, config.audio.n_mels, config.audio.max_length,
+            config.model.crnn_rnn_hidden_size, config.model.crnn_rnn_num_layers,
+            dropout_rate_expert, use_attention, config.model.crnn_attention_hidden_size)
         crnn_model, crnn_history = train_model(
-            model=crnn_model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            num_epochs=num_epochs_experts,
-            learning_rate=learning_rate,
-            device=device,
-            early_stopping_patience=10,
-            model_name='CRNN Expert',
-            class_weights=class_weights
-        )
+            crnn_model, train_loader, val_loader, num_epochs_experts, learning_rate,
+            device, early_stop, 'CRNN', class_weights)
+        torch.save({'model_state_dict': crnn_model.state_dict(), 'num_classes': num_classes}, crnn_model_path)
+        crnn_test_acc, _, _ = evaluate_model(crnn_model, test_loader, LABEL_TO_SONG, device)
+        print(f"Expert Acc: MobileNet={mobilenet_test_acc:.2f}%, CRNN={crnn_test_acc:.2f}%")
 
-        # 保存 CRNN 模型
-        torch.save({
-            'model_state_dict': crnn_model.state_dict(),
-            'num_classes': num_classes,
-            'history': crnn_history
-        }, crnn_model_path)
-        print(f"✓ CRNN 模型已保存到: {crnn_model_path}")
-
-        # 评估 CRNN
-        print("\n--- CRNN 专家测试评估 ---")
-        crnn_test_acc, _, _ = evaluate_model(crnn_model, test_loader, LABEL_TO_SONG, device=device)
-
-        print("\n" + "="*60)
-        print("专家模型训练完成")
-        print(f"  MobileNetV3-Small 测试准确率: {mobilenet_test_acc:.2f}%")
-        print(f"  CRNN 测试准确率: {crnn_test_acc:.2f}%")
-        print("="*60)
-
-    # ==========================================
-    # 步骤 7: 创建并训练融合集成模型
-    # ==========================================
-    print("\n" + "="*60)
-    print("步骤 7: 创建融合集成模型")
-    print("="*60)
-
+    # Step 7: 融合模型
+    log_section("Step 7: Fusion Ensemble")
     ensemble_model = FeatureFusionEnsemble(
-        num_classes=num_classes,
-        freeze_experts=True,
-        dropout_rate_fusion=dropout_rate_fusion,
-        use_attention=use_attention,
-        use_f0=use_f0  # 是否使用 F0 特征（需要配合 DualSpectrogramDataset）
-    )
+        num_classes, config.model.freeze_experts, dropout_rate_fusion, use_attention, use_f0)
+    ensemble_model.load_expert_weights(crnn_model_path, mobilenet_model_path, device)
 
-    # 加载预训练的专家权重
-    ensemble_model.load_expert_weights(
-        crnn_path=crnn_model_path,
-        mobilenet_path=mobilenet_model_path,
-        device=device
-    )
+    total_p, train_p = count_parameters(ensemble_model)
+    print(f"Ensemble: Total={total_p:,}, Trainable={train_p:,}")
 
-    # 统计参数
-    total_params, trainable_params = count_parameters(ensemble_model)
-    print(f"\n融合集成模型:")
-    print(f"  总参数: {total_params:,}")
-    print(f"  (冻结后) 可训练参数: {trainable_params:,}")
-
-    # 训练融合分类器
     ensemble_model, fusion_history = train_model(
-        model=ensemble_model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        num_epochs=num_epochs_fusion,
-        learning_rate=0.001,  # 融合分类器可以用稍高的学习率
-        device=device,
-        early_stopping_patience=5,
-        model_name='Fusion Ensemble',
-        class_weights=class_weights,
-        freeze_experts=True
-    )
+        ensemble_model, train_loader, val_loader, num_epochs_fusion, learning_rate * 2,
+        device, config.training.early_stopping_patience or 5, 'Fusion', class_weights, config.model.freeze_experts)
 
-    # ==========================================
-    # 步骤 8: 测试评估
-    # ==========================================
-    print("\n" + "="*60)
-    print("步骤 8: 融合集成模型测试评估")
-    print("="*60)
+    # Step 8: 评估
+    log_section("Step 8: Evaluation")
+    ensemble_test_acc, predictions, true_labels = evaluate_model(ensemble_model, test_loader, LABEL_TO_SONG, device)
 
-    ensemble_test_acc, predictions, true_labels = evaluate_model(
-        model=ensemble_model,
-        test_loader=test_loader,
-        label_to_song=LABEL_TO_SONG,
-        device=device
-    )
-
-    # ==========================================
-    # 步骤 9: 保存模型
-    # ==========================================
+    # Step 9: 保存
     ensemble_save_path = 'feature_fusion_ensemble_model.pth'
-    torch.save({
-        'model_state_dict': ensemble_model.state_dict(),
-        'num_classes': num_classes,
-        'test_acc': ensemble_test_acc,
-        'history': fusion_history
-    }, ensemble_save_path)
-    print(f"\n✓ 融合集成模型已保存到: {ensemble_save_path}")
+    torch.save({'model_state_dict': ensemble_model.state_dict(), 'num_classes': num_classes,
+                'test_acc': ensemble_test_acc, 'history': fusion_history}, ensemble_save_path)
+    print(f"Model saved: {ensemble_save_path}")
 
     # 绘制训练曲线
     plot_training_history(fusion_history, save_path='training_history_fusion_ensemble.png')
 
-    # ==========================================
-    # 总结
-    # ==========================================
-    print("\n" + "="*80)
-    print("互补特征融合集成方案完成！")
-    print("="*80)
-    print(f"\n最终测试准确率: {ensemble_test_acc:.2f}%")
-    print("\n模型文件:")
-    print(f"  - CRNN 专家: {crnn_model_path}")
-    print(f"  - MobileNetV3-Small 专家: {mobilenet_model_path}")
-    print(f"  - 融合集成模型: {ensemble_save_path}")
-    print("="*80)
-
+    print(f"\n{'='*60}\nDone! Test Acc: {ensemble_test_acc:.2f}%\n{'='*60}")
     return ensemble_model, fusion_history, ensemble_test_acc
 
 
-# ==========================================
-# 12. 入口点
-# ==========================================
+# ==================== 入口 ====================
 if __name__ == '__main__':
-    run_feature_fusion_ensemble_pipeline(
-        augment=True,
-        batch_size=32,
-        num_epochs_experts=60,
-        num_epochs_fusion=15,
-        learning_rate=0.0005,
-        n_jobs=16,
-        force_regenerate=False,
-        skip_expert_training=False,
-        crnn_model_path='crnn_model_mel_torchaudio.pth',
-        mobilenet_model_path='mobilenetv3_model_mel_torchaudio.pth',
-        dropout_rate_fusion=0.6,
-        dropout_rate_expert=0.7,
-        use_attention=True,
-        use_f0=True
-    )
+    run_feature_fusion_ensemble_pipeline(config=CONFIG, augment=True, use_f0=True)
 
